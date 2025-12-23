@@ -19,6 +19,7 @@ import abc
 import argparse
 import asyncio
 import datetime
+import errno
 import functools
 import importlib.metadata
 import json
@@ -537,45 +538,109 @@ async def _run(  # pylint: disable=too-many-arguments
     )
     if mqtt_password and not mqtt_username:
         raise ValueError("Missing MQTT username")
-    async with aiomqtt.Client(  # raises aiomqtt.MqttError
-        hostname=mqtt_host,
-        port=mqtt_port,
-        # > The settings [...] usually represent a higher security level than
-        # > when calling the SSLContext constructor directly.
-        # https://web.archive.org/web/20230714183106/https://docs.python.org/3/library/ssl.html
-        tls_context=None if mqtt_disable_tls else ssl.create_default_context(),
-        username=None if mqtt_username is None else mqtt_username,
-        password=None if mqtt_password is None else mqtt_password,
-        will=aiomqtt.Will(  # e.g. on SIGTERM & SIGKILL
-            topic=state.mqtt_availability_topic,
-            payload=_MQTT_PAYLOAD_NOT_AVAILABLE,
-            retain=True,
-        ),
-    ) as mqtt_client:
-        _LOGGER.debug("connected to MQTT broker %s:%d", mqtt_host, mqtt_port)
-        if not state.shutdown_lock_acquired:
-            state.acquire_shutdown_lock()
-        await state.publish_homeassistant_device_config(mqtt_client=mqtt_client)
-        await state.publish_preparing_for_shutdown(mqtt_client=mqtt_client)
+    
+    # Helper function to check if error is transient (retryable)
+    def _is_transient_error(exc: Exception) -> bool:
+        """Check if the error is transient and should trigger a retry."""
+        # Check for transient errno values in error message
+        err_str = str(exc)
+        
+        # Define transient errno values
+        # Python error messages use format: "[Errno X]"
+        transient_errnos = [
+            errno.EHOSTUNREACH,     # No route to host
+            errno.ECONNREFUSED,     # Connection refused
+            errno.ETIMEDOUT,        # Connection timed out
+            errno.ENETUNREACH,      # Network unreachable
+            errno.ECONNRESET,       # Connection reset by peer
+            errno.EPIPE,            # Broken pipe
+            errno.EADDRNOTAVAIL,    # Address not available (temporary)
+            errno.EAGAIN,           # Resource temporarily unavailable
+            errno.EWOULDBLOCK,      # Operation would block
+            errno.EINPROGRESS,      # Operation in progress
+        ]
+        
+        # Generate patterns from errno values
+        transient_patterns = [f'[Errno {err}]' for err in transient_errnos]
+        
+        # Check if any transient pattern appears in the error message
+        for pattern in transient_patterns:
+            if pattern in err_str:
+                return True
+        
+        # Check underlying exception if available
+        underlying_exc = exc.__cause__ if exc.__cause__ else exc
+        
+        # ConnectionError is generally transient (e.g., broker down, network issues)
+        if isinstance(underlying_exc, ConnectionError):
+            return True
+        
+        # For any other error, assume it's fatal (bad config, auth failure, etc.)
+        return False
+    
+    # Retry loop for MQTT connection
+    retry_logged = False
+    
+    while True:
         try:
-            await mqtt_client.publish(
-                topic=state.mqtt_availability_topic,
-                payload=_MQTT_PAYLOAD_AVAILABLE,
-                retain=True,
-            )
-            # asynpio.TaskGroup added in python3.11
-            await asyncio.gather(
-                _mqtt_message_loop(state=state, mqtt_client=mqtt_client),
-                _dbus_signal_loop(state=state, mqtt_client=mqtt_client),
-                return_exceptions=False,
-            )
-        finally:  # e.g. on SIGINT
-            # https://web.archive.org/web/20250101080719/https://github.com/empicano/aiomqtt/issues/28
-            await mqtt_client.publish(
-                topic=state.mqtt_availability_topic,
-                payload=_MQTT_PAYLOAD_NOT_AVAILABLE,
-                retain=True,
-            )
+            async with aiomqtt.Client(  # raises aiomqtt.MqttError
+                hostname=mqtt_host,
+                port=mqtt_port,
+                # > The settings [...] usually represent a higher security level than
+                # > when calling the SSLContext constructor directly.
+                # https://web.archive.org/web/20230714183106/https://docs.python.org/3/library/ssl.html
+                tls_context=None if mqtt_disable_tls else ssl.create_default_context(),
+                username=None if mqtt_username is None else mqtt_username,
+                password=None if mqtt_password is None else mqtt_password,
+                will=aiomqtt.Will(  # e.g. on SIGTERM & SIGKILL
+                    topic=state.mqtt_availability_topic,
+                    payload=_MQTT_PAYLOAD_NOT_AVAILABLE,
+                    retain=True,
+                ),
+            ) as mqtt_client:
+                _LOGGER.debug("connected to MQTT broker %s:%d", mqtt_host, mqtt_port)
+                if not state.shutdown_lock_acquired:
+                    state.acquire_shutdown_lock()
+                await state.publish_homeassistant_device_config(mqtt_client=mqtt_client)
+                await state.publish_preparing_for_shutdown(mqtt_client=mqtt_client)
+                try:
+                    await mqtt_client.publish(
+                        topic=state.mqtt_availability_topic,
+                        payload=_MQTT_PAYLOAD_AVAILABLE,
+                        retain=True,
+                    )
+                    # asynpio.TaskGroup added in python3.11
+                    await asyncio.gather(
+                        _mqtt_message_loop(state=state, mqtt_client=mqtt_client),
+                        _dbus_signal_loop(state=state, mqtt_client=mqtt_client),
+                        return_exceptions=False,
+                    )
+                finally:  # e.g. on SIGINT
+                    # https://web.archive.org/web/20250101080719/https://github.com/empicano/aiomqtt/issues/28
+                    await mqtt_client.publish(
+                        topic=state.mqtt_availability_topic,
+                        payload=_MQTT_PAYLOAD_NOT_AVAILABLE,
+                        retain=True,
+                    )
+        except aiomqtt.MqttError as exc:
+            # Check if error is transient (retryable) or fatal
+            if _is_transient_error(exc):
+                # Transient error - retry
+                if not retry_logged:
+                    _LOGGER.warning(
+                        "Failed to connect to MQTT broker: %s. Will continue to retry every second until connected.",
+                        exc,
+                    )
+                    retry_logged = True
+                await asyncio.sleep(1)
+                continue  # Retry the connection
+            else:
+                # Fatal error - give up
+                _LOGGER.error(
+                    "Fatal error connecting to MQTT broker (will not retry): %s",
+                    exc,
+                )
+                raise  # Re-raise the fatal error
 
 
 def _main() -> None:
