@@ -1,0 +1,61 @@
+name: Update from upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: cachix/install-nix-action@v27
+
+      - name: Check for new upstream release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current=$(grep 'version = ' flake.nix | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          latest=$(gh api repos/fphammerle/systemctl-mqtt/releases/latest --jq '.tag_name' | sed 's/^v//')
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$current" != "$latest" ]; then
+            echo "update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream release
+        if: steps.check.outputs.update == 'true'
+        run: |
+          version="${{ steps.check.outputs.latest }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/fphammerle/systemctl-mqtt.git
+          git fetch upstream --tags
+          git merge "v${version}" -m "Merge upstream v${version}"
+
+      - name: Update version
+        if: steps.check.outputs.update == 'true'
+        run: |
+          version="${{ steps.check.outputs.latest }}"
+          sed -i "s/version = \".*\"/version = \"${version}\"/" flake.nix
+
+      - name: Update flake lock
+        if: steps.check.outputs.update == 'true'
+        run: nix flake update
+
+      - name: Commit and tag
+        if: steps.check.outputs.update == 'true'
+        run: |
+          version="${{ steps.check.outputs.latest }}"
+          git add flake.nix flake.lock
+          git commit -m "Update to v${version}"
+          git tag "v${version}"
+          git push origin master
+          git push --tags
