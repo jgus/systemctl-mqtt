@@ -37,8 +37,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/fphammerle/systemctl-mqtt.git
-          git fetch upstream --tags
-          git merge "v${version}" -m "Merge upstream v${version}"
+          git fetch upstream tag "v${version}" --no-tags
+          git merge FETCH_HEAD -m "Merge upstream v${version}"
 
       - name: Update version
         if: steps.check.outputs.update == 'true'
@@ -50,7 +50,7 @@ jobs:
         if: steps.check.outputs.update == 'true'
         run: nix flake update
 
-      - name: Commit and tag
+      - name: Commit, tag, and push
         if: steps.check.outputs.update == 'true'
         run: |
           version="${{ steps.check.outputs.latest }}"
@@ -58,4 +58,4 @@ jobs:
           git commit -m "Update to v${version}"
           git tag "v${version}"
           git push origin master
-          git push --tags
+          git push origin "v${version}"
