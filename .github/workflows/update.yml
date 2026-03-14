@@ -56,6 +56,6 @@ jobs:
           version="${{ steps.check.outputs.latest }}"
           git add flake.nix flake.lock
           git commit -m "Update to v${version}"
-          git tag "v${version}"
+          git tag -f "v${version}"
           git push origin master
           git push origin "v${version}"
