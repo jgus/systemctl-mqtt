@@ -1,0 +1,60 @@
+name: Update from upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - uses: cachix/install-nix-action@v27
+
+      - name: Check for new upstream release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current=$(grep 'version = ' flake.nix | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          latest=$(gh api repos/fphammerle/systemctl-mqtt/releases/latest --jq '.tag_name' | sed 's/^v//')
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$current" != "$latest" ]; then
+            echo "update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream release
+        if: steps.check.outputs.update == 'true'
+        run: |
+          version="${{ steps.check.outputs.latest }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/fphammerle/systemctl-mqtt.git
+          git fetch upstream tag "v${version}" --no-tags
+          git merge FETCH_HEAD -m "Merge upstream v${version}"
+
+      - name: Update version
+        if: steps.check.outputs.update == 'true'
+        run: |
+          version="${{ steps.check.outputs.latest }}"
+          sed -i "s/version = \".*\"/version = \"${version}\"/" flake.nix
+
+      - name: Update flake lock
+        if: steps.check.outputs.update == 'true'
+        run: nix flake update
+
+      - name: Commit, tag, and push
+        if: steps.check.outputs.update == 'true'
+        run: |
+          version="${{ steps.check.outputs.latest }}"
+          git add flake.nix flake.lock
+          git commit -m "Update to v${version}"
+          git tag -f "v${version}"
+          git push origin master
+          git push origin "v${version}"
