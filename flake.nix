@@ -16,7 +16,7 @@
       pkgs = nixpkgs.legacyPackages.${system};
       pythonPackages = pkgs.python3Packages;
 
-      version = "3.0.0";
+      version = "0.0.0";
     in
     {
       packages.default = pythonPackages.buildPythonApplication {
